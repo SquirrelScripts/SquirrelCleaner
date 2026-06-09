@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Quick-and-dirty Windows cache cleaner. The squirrel cleans your stash.
 
@@ -42,11 +42,39 @@ function Test-IsAdmin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-SafeChildren {
+    <# Recurse like Get-ChildItem -Recurse, but never descend into (or emit)
+       junctions/symlinks. A reparse point dropped in %TEMP% by an installer
+       could otherwise aim the delete loop at real data elsewhere on disk. #>
+    param(
+        [string]$Root,
+        [switch]$Directories   # emit directories instead of files
+    )
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
+    if (-not $rootItem -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return }
+
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    $stack.Push($Root)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        foreach ($item in Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($item.PSIsContainer) {
+                $stack.Push($item.FullName)
+                if ($Directories) { $item }
+            }
+            elseif (-not $Directories) { $item }
+        }
+    }
+}
+
 # running tallies (script scope so Clear-Target can update them)
-$script:WouldFree   = 0
-$script:Freed       = 0
-$script:Report      = [ordered]@{}
-$script:TargetIdx   = 0
+$script:WouldFree    = 0
+$script:Freed        = 0
+$script:SkippedFiles = 0
+$script:SkippedBytes = 0
+$script:Report       = [ordered]@{}
+$script:TargetIdx    = 0
 $script:TargetCount = 0
 
 function Clear-Target {
@@ -56,10 +84,10 @@ function Clear-Target {
         [string[]]$Paths
     )
 
-    # one enumeration: gather every cache file under these paths
+    # one enumeration: gather every cache file under these paths (junction-safe)
     $files = foreach ($p in $Paths) {
         if (Test-Path -LiteralPath $p) {
-            Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorAction SilentlyContinue
+            Get-SafeChildren -Root $p
         }
     }
     if (-not $files) { return }
@@ -70,7 +98,7 @@ function Clear-Target {
 
     # outer bar: % of targets completed so far
     $outerPct = [int](($script:TargetIdx - 1) / [Math]::Max($script:TargetCount, 1) * 100)
-    Write-Progress -Id 0 -Activity '🐿️  SquirrelCleaner' `
+    Write-Progress -Id 0 -Activity 'SquirrelCleaner' `
         -Status "[$script:TargetIdx/$script:TargetCount]  $Name  —  $(Format-Bytes $size)" `
         -PercentComplete $outerPct
 
@@ -86,16 +114,21 @@ function Clear-Target {
                     -PercentComplete ([int]($done / $total * 100))
             }
             try   { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $got += $f.Length }
-            catch { }   # locked/in-use file — skip
+            catch {
+                # locked/in-use file — skip, but keep the receipts
+                $script:SkippedFiles++
+                $script:SkippedBytes += $f.Length
+                Write-Verbose "Skipped (locked/in-use): $($f.FullName)"
+            }
         }
-        Write-Progress -Id 1 -Completed
+        Write-Progress -Id 1 -Activity 'SquirrelCleaner' -Completed
 
         # sweep up now-empty folders, deepest first.
         # Directory.Delete($false) removes only if empty and throws (not prompts)
         # otherwise — so non-empty cache dirs get skipped silently, no Y/N nag.
         foreach ($p in $Paths) {
             if (Test-Path -LiteralPath $p) {
-                Get-ChildItem -LiteralPath $p -Recurse -Directory -Force -ErrorAction SilentlyContinue |
+                Get-SafeChildren -Root $p -Directories |
                     Sort-Object { $_.FullName.Length } -Descending |
                     ForEach-Object {
                         try { [System.IO.Directory]::Delete($_.FullName, $false) } catch { }
@@ -111,8 +144,13 @@ function Clear-Target {
 }
 
 # ------------------------------------------------------------------ banner ----
+# 🐿️ only struts on PS 7+ — Windows PowerShell 5.1's conhost renders him as tofu
+$ShowMascot = $PSVersionTable.PSVersion.Major -ge 7
+$Mascot     = if ($ShowMascot) { '🐿️  ' } else { '' }    # banner prefix
+$MascotEnd  = if ($ShowMascot) { '  🐿️' } else { '' }    # summary suffix
+
 Write-Host ""
-Write-Host "  🐿️  SquirrelScripts — Cache Cleaner" -ForegroundColor DarkYellow
+Write-Host "  ${Mascot}SquirrelScripts — Cache Cleaner" -ForegroundColor DarkYellow
 Write-Host "  -----------------------------------" -ForegroundColor DarkGray
 
 # admin-only switches need an elevated session
@@ -185,12 +223,26 @@ if ($IncludeSystem) {
 }
 
 if ($IncludeWindowsUpdate) {
-    if ($PSCmdlet.ShouldProcess('Windows Update download cache', 'Clear')) {
-        Stop-Service -Name 'wuauserv' -Force -ErrorAction SilentlyContinue
-    }
+    $wuPath = "$env:WINDIR\SoftwareDistribution\Download"
     $script:TargetIdx++
-    Clear-Target -Name 'Windows Update' -Paths @("$env:WINDIR\SoftwareDistribution\Download")
-    Start-Service -Name 'wuauserv' -ErrorAction SilentlyContinue
+    # One prompt covers the whole operation: stop service -> clear -> restart.
+    # Restart only happens if *we* stopped it, so users who keep wuauserv
+    # disabled don't get it resurrected behind their back.
+    if ($PSCmdlet.ShouldProcess('Windows Update download cache (wuauserv stopped during clean)', 'Clear')) {
+        $wasRunning = (Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue).Status -eq 'Running'
+        if ($wasRunning) { Stop-Service -Name 'wuauserv' -Force -ErrorAction SilentlyContinue }
+        Clear-Target -Name 'Windows Update' -Paths @($wuPath) -Confirm:$false
+        if ($wasRunning) { Start-Service -Name 'wuauserv' -ErrorAction SilentlyContinue }
+    }
+    else {
+        # -WhatIf (or declined): touch nothing, but still report the would-be win
+        $size = (Get-SafeChildren -Root $wuPath |
+                 Measure-Object -Property Length -Sum).Sum
+        if ($size) {
+            $script:WouldFree += $size
+            $script:Report['Windows Update'] = $size
+        }
+    }
 }
 
 # --------------------------------------------------------------- recycle bin ----
@@ -202,8 +254,8 @@ if ($EmptyRecycleBin) {
 }
 
 # clear progress bars before printing the final report
-Write-Progress -Id 1 -Completed
-Write-Progress -Id 0 -Completed
+Write-Progress -Id 1 -Activity 'SquirrelCleaner' -Completed
+Write-Progress -Id 0 -Activity 'SquirrelCleaner' -Completed
 
 # ------------------------------------------------------------------- flush ----
 Write-Host ""
@@ -213,10 +265,16 @@ foreach ($name in $script:Report.Keys) {
 Write-Host "  --------------------------------" -ForegroundColor DarkGray
 
 if ($WhatIfPreference) {
-    Write-Host ("  Would free {0}  🐿️" -f (Format-Bytes $script:WouldFree)) -ForegroundColor Yellow
+    Write-Host ("  Would free {0}{1}" -f (Format-Bytes $script:WouldFree), $MascotEnd) -ForegroundColor Yellow
     Write-Host "  (run again without -WhatIf to actually clean)" -ForegroundColor DarkGray
 }
 else {
-    Write-Host ("  Freed {0}  🐿️" -f (Format-Bytes $script:Freed)) -ForegroundColor Green
+    Write-Host ("  Freed {0}{1}" -f (Format-Bytes $script:Freed), $MascotEnd) -ForegroundColor Green
+    if ($script:SkippedFiles -gt 0) {
+        Write-Host ("  Skipped {0} locked/in-use file{1} ({2}) — rerun after closing apps to grab more" -f `
+            $script:SkippedFiles,
+            $(if ($script:SkippedFiles -eq 1) { '' } else { 's' }),
+            (Format-Bytes $script:SkippedBytes)) -ForegroundColor DarkGray
+    }
 }
 Write-Host ""

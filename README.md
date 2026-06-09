@@ -70,7 +70,8 @@ Reasonable thing to ask before running a stranger's script with admin:
 
 - It only touches cache and temp directories — the stuff Windows and your browsers regenerate on their own. No documents, no settings, no saved logins, no bookmarks.
 - It **won't** force-close your browser. If one's open, it skips the files that are locked and tells you to close it for a deeper clean.
-- `-WhatIf` shows you exactly what it'd remove before you commit. Read the code — it's ~200 lines and not minified.
+- `-WhatIf` shows you exactly what it'd remove before you commit. Read the code — it's ~260 lines and not minified.
+- It's **junction/symlink-aware** — it won't follow reparse points, so a symlink dropped in `%TEMP%` by a sketchy installer can't redirect the delete loop at real data elsewhere on disk.
 
 ## Requirements
 
